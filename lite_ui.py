@@ -182,7 +182,7 @@ def _competitors(data):
 def _topic_finder(category,data):
     t=sc.topics_with_evidence(data['reels'],data['trends'])
     if category!='All':t=t[t['Category']==category]
-    note=('These are **editorially curated video ideas**. Research priority /4 is an evidence triage score, '
+    note=('These are **editorially curated video ideas**. Research priority /5 is an evidence triage score, '
           '**not a predicted view count or a Story Potential Index**. If evidence is missing, a topic is '
           'marked research pending. Uploaded trend records are dated, not real-time.')
     return note,t.head(18)
@@ -327,35 +327,49 @@ def _export_report(data):
     return str(path)
 
 
-def init_app(base):
+def init_app(base, theme=None, css=None):
     global BASE
     BASE=sc.choose_paths(base)
     initial=_load_initial()
-    with gr.Blocks(title='StoryScout Lite | Research & Reel Index') as app:
+    # Gradio 5 accepts theme and CSS in Blocks; Gradio 6 moves them to launch().
+    blocks_kwargs = {'title': 'StoryScout Lite | VicharDesk Content Intelligence'}
+    if int(gr.__version__.split('.')[0]) < 6:
+        blocks_kwargs.update(theme=theme, css=css)
+    with gr.Blocks(**blocks_kwargs) as app:
         research=gr.State(value=_load_initial)
-        gr.Markdown('# StoryScout Lite | Content Research & Quality Index\n'
-                    'Upload real data, compare competitors, discover story opportunities and review draft reels. '
-                    '**No API key or video-understanding model required.**')
-        status=gr.Markdown(value=_summary(initial))
-        with gr.Tabs():
+        gr.HTML("""
+        <section class="ss-hero" aria-label="StoryScout introduction">
+            <div class="ss-hero-main">
+                <div class="ss-eyebrow"><span class="ss-dot"></span> VICHARDESK / CONTENT INTELLIGENCE</div>
+                <h1>StoryScout <span>Lite.</span></h1>
+                <p class="ss-hero-summary">Find stronger stories. Understand your competition. Check every reel before publishing.</p>
+                <div class="ss-feature-pills">
+                    <span>01 &nbsp; Research</span><span>02 &nbsp; Discover</span><span>03 &nbsp; Evaluate</span>
+                </div>
+            </div>
+            <div class="ss-hero-mark" aria-hidden="true">S<span>↗</span></div>
+        </section>
+        """, elem_id='ss-hero')
+        status=gr.Markdown(value=_summary(initial),elem_id='ss-research-status',elem_classes=['ss-status-card'])
+        with gr.Tabs(elem_id='ss-tabs'):
             with gr.Tab('1 · Upload Research'):
-                gr.Markdown('### Load real research files\n'
+                gr.Markdown('### Upload your research\n'
                     'Choose files here — they will work in **all tabs for this session**. '
                     'Uploads are not shared with other visitors and do not permanently update GitHub. '
                     'If you want public research available on every visit, see **How to publish datasets** below.')
                 with gr.Row():
                     with gr.Column():
                         apify=gr.File(label='Upload Apify reels (CSV or JSON)',file_types=['.csv','.json'],type='filepath')
-                        apify_button=gr.Button('Import public reels',variant='primary')
+                        apify_button=gr.Button('Import public reels',variant='primary',elem_classes=['ss-primary-action'])
                     with gr.Column():
                         trendfile=gr.File(label='Upload Google Trends export (CSV)',file_types=['.csv'],type='filepath')
                         trenddate=gr.Textbox(label='Snapshot date (YYYY-MM-DD; leave blank for today)',value='')
-                        trends_button=gr.Button('Import Google Trends',variant='primary')
+                        trends_button=gr.Button('Import Google Trends',variant='primary',elem_classes=['ss-primary-action'])
                 import_msg=gr.Markdown()
                 preview=gr.Dataframe(label='Latest imported data preview',interactive=False)
                 apify_button.click(_upload_reels,[apify,research],[research,import_msg,preview,status])
                 trends_button.click(_upload_trends,[trendfile,trenddate,research],[research,import_msg,preview,status])
-                gr.Markdown('### Optional: Upload reviewed competitor ICI ratings\n'
+                gr.Markdown('### Add benchmark reviews (optional)\n'
                     'If you have a CSV with `video_id`, `source_type=competitor`, and eight factor columns '
                     '(`hook`, `narrative`, `clarity`, `visuals`, `pacing`, `relevance`, `shareability`, `brand_cta`), '
                     'import it here. Rows with missing ratings are ignored by the benchmark.')
@@ -363,7 +377,7 @@ def init_app(base):
                     reviewfile=gr.File(label='ICI reviews CSV',file_types=['.csv'],type='filepath')
                     reviewbutton=gr.Button('Import completed ICI reviews')
                 reviewbutton.click(_upload_reviews,[reviewfile,research],[research,import_msg,preview,status])
-                gr.Markdown('### Download your session research\n'
+                gr.Markdown('### Export your research\n'
                     'This ZIP contains the *currently loaded* research tables so you can save them. '
                     'Remove private data before putting them in a public GitHub repository.')
                 export_btn=gr.Button('Download loaded research CSVs')
@@ -373,19 +387,19 @@ def init_app(base):
                             'upload the cleaned files to your GitHub repository under `data/`, and commit. '
                             'Render will redeploy automatically. Your website link stays the same.')
             with gr.Tab('2 · Competitor Market'):
-                gr.Markdown('Compare observed public views/plays and engagement. Accounts differ in audience size, so creator-normalised counts are shown.')
-                cb=gr.Button('Analyse competitors',variant='primary')
-                ct=gr.Markdown(); market=gr.Dataframe(label='Category summary',interactive=False)
-                top=gr.Dataframe(label='Relative performance by reel',interactive=False)
+                gr.Markdown('### Competitor overview\nExplore observed views, plays and engagement. Relative performance is normalised within each creator, so large accounts do not automatically dominate.',elem_classes=['ss-intro'])
+                cb=gr.Button('Analyse competitors',variant='primary',elem_classes=['ss-primary-action'])
+                ct=gr.Markdown(); market=gr.Dataframe(label='Category summary',interactive=False,elem_classes=['ss-data-table'])
+                top=gr.Dataframe(label='Relative performance by reel',interactive=False,elem_classes=['ss-data-table'])
                 cb.click(_competitors,[research],[ct,market,top])
                 report_btn=gr.Button('Export presentation research summary')
                 report_download=gr.File(label='Download report (.md)')
                 report_btn.click(_export_report,[research],[report_download])
             with gr.Tab('3 · StoryScout Topic Finder'):
-                gr.Markdown('The system recommends ideas from a fixed VicharDesk editorial library and tags supporting trends/competitor content using rules, not an LLM.')
+                gr.Markdown('### Find your next story\nDiscover ideas suited to VicharDesk, with supporting signals from your uploaded research. Suggestions are curated, not guaranteed to go viral.',elem_classes=['ss-intro'])
                 category=gr.Dropdown(['All',*sc.CATEGORIES],value='All',label='Category')
-                topic_btn=gr.Button('Suggest topics from loaded research',variant='primary')
-                tn=gr.Markdown(); tt=gr.Dataframe(label='Suggested topics and supporting evidence',interactive=False)
+                topic_btn=gr.Button('Suggest topics from loaded research',variant='primary',elem_classes=['ss-primary-action'])
+                tn=gr.Markdown(); tt=gr.Dataframe(label='Suggested topics and supporting evidence',interactive=False,elem_classes=['ss-data-table'])
                 topic_btn.click(_topic_finder,[category,research],[tn,tt])
                 gr.Markdown('### Optional — Score a proposed topic (SPI)')
                 title=gr.Textbox(label='Proposed title',placeholder='e.g. Why gold prices change in India')
@@ -398,11 +412,11 @@ def init_app(base):
                 with gr.Row():
                     for k in list(sc.SPI_WEIGHTS)[3:]:
                         spi_sliders.append(gr.Slider(0,100,step=5,value=50,label=f'{sc.SPI_LABELS[k]} ({sc.SPI_WEIGHTS[k]}%)'))
-                spi_btn=gr.Button('Calculate Story Potential Index')
+                spi_btn=gr.Button('Calculate Story Potential Index',variant='primary',elem_classes=['ss-primary-action'])
                 spi_text=gr.Markdown(); spi_table=gr.Dataframe(label='SPI factor breakdown',interactive=False)
                 spi_btn.click(_score_spi,[title,tc,angle,*spi_sliders],[spi_text,spi_table])
             with gr.Tab('4 · Reel Quality Index'):
-                gr.Markdown('### Eight-factor review of an uploaded reel\n'
+                gr.Markdown('### Check your reel before publishing\n'
                     'Watch the actual reel and choose the eight factor ratings. '
                     '**An MP4 upload is for playback only**; there is no automatic AI review.')
                 bench_btn=gr.Button('Show benchmark')
@@ -426,8 +440,8 @@ def init_app(base):
                     for k in list(sc.ICI_WEIGHTS)[4:]:
                         ici_sliders.append(gr.Slider(0,5,step=1,value=3,label=f'{sc.ICI_LABELS[k]} ({sc.ICI_WEIGHTS[k]}%)'))
                 confirmed=gr.Checkbox(value=False,label='I watched the reel (or independently reviewed it) and consciously rated all eight factors.')
-                ici_btn=gr.Button('Calculate complete ICI comparison',variant='primary')
-                ici_desc=gr.Markdown(); ici_table=gr.Dataframe(label='Factor-by-factor index match',interactive=False)
+                ici_btn=gr.Button('Calculate complete ICI comparison',variant='primary',elem_classes=['ss-primary-action'])
+                ici_desc=gr.Markdown(); ici_table=gr.Dataframe(label='Factor-by-factor index match',interactive=False,elem_classes=['ss-data-table'])
                 ici_btn.click(_ici,[vidfile,reel_title,source_type,video_id,reviewer,note,confirmed,research,*ici_sliders],
                               [ici_desc,ici_table])
                 gr.Markdown('### Build a competitor benchmark\n'
@@ -438,7 +452,7 @@ def init_app(base):
                 save_btn.click(_save_review,[video_id,reel_title,source_type,reviewer,note,confirmed,research,*ici_sliders],
                                [research,save_note,bench_text,bench_table,status])
             with gr.Tab('5 · Ask StoryScout'):
-                gr.Markdown('A **rule-based research helper**, not a generative AI chatbot. It answers supported queries using the research in your current session.')
+                gr.Markdown('### Ask StoryScout\nA lightweight research assistant for common questions about your imported data. It uses fixed rules, not generative AI.',elem_classes=['ss-intro'])
                 gr.ChatInterface(fn=_rule_answer,additional_inputs=[research])
-        gr.Markdown('**Study note:** This tool supports evidence-informed editorial choices. It does not predict Instagram views, measure causal impact, or infer video quality from an upload alone.')
+        gr.Markdown('**Research note:** StoryScout supports evidence-informed decisions. It does not predict views, establish causality, or automatically analyse uploaded video content.',elem_id='ss-footer-note')
     return app

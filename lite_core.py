@@ -253,24 +253,11 @@ def topics_with_evidence(reels,trends):
         sufficient=int(matches['relative_performance'].notna().sum())>=3 if cm else False
         trends_n=len(ts)
         demand_seen=(trends_n>0) or (sufficient and pd.notna(rv) and rv>=1.2)
-        priority=
-        strong_performance = (
-            sufficient
-            and pd.notna(rv)
-            and rv >= 1.2
-        )
-
-        low_coverage = (
-            demand_seen
-            and 0 < cmr <= 2
-        )
-
-        priority = (
-            (2 if trends_n > 0 else 0)
-            + (2 if strong_performance else 0)
-            + (1 if low_coverage else 0)
-        )
-
+        # A topic can have 3+ reels but only 1-2 creators covering it.
+        # This makes the full five-point score possible without rewarding zero coverage.
+        strong_performance = sufficient and pd.notna(rv) and rv >= 1.2
+        low_coverage = demand_seen and 0 < cmr <= 2
+        priority = (2 if trends_n > 0 else 0) + (2 if strong_performance else 0) + (1 if low_coverage else 0)
         if priority>=4:label='Review first'
         elif priority>=2:label='Worth investigating'
         else:label='Research pending'

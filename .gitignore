@@ -1,0 +1,21 @@
+# Local Python outputs
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+.env.*
+*.key
+*.pem
+*credentials*
+*secret*
+# Private and ephemeral material
+lite_demo/
+lite_exports/
+data/lite_insights.csv
+data/vichardesk_insights.csv
+data/*private*
+data/*screenshot*
+*.mp4
+*.mov

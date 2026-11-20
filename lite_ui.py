@@ -1,225 +1,473 @@
-"""Gradio interface for the offline StoryScout Lite prototype."""
-import pandas as pd
+"""StoryScout Lite public Gradio application.
+
+No synthetic mode. Research CSV uploads are SESSION-ONLY to avoid exposing other
+visitors' data or incorrectly claiming free Render storage is permanent.
+"""
+from datetime import datetime, timezone
+from pathlib import Path
+import os
+import tempfile
+import zipfile
+import uuid
+
 import gradio as gr
+import numpy as np
+import pandas as pd
 import lite_core as sc
 
 BASE = None
 
+REVIEW_COLS = ['video_id','title','source_type','reviewer','review_date',
+               *sc.ICI_WEIGHTS,'overall_score','notes']
+TREND_COLS = ['search_term','volume_band','started','status','snapshot_date','category','source']
+
+
+def _clone(research):
+    return {k: v.copy(deep=True) for k,v in research.items()}
+
+
+def _clean_reviews(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=REVIEW_COLS)
+    d = df.copy()
+    d = d.rename(columns={'video_title':'title', 'rater':'reviewer',
+                           'evidence_notes':'notes'})
+    d = d.loc[:, ~d.columns.duplicated()]
+    if 'video_id' not in d:
+        raise ValueError('Review file must contain a video_id column.')
+    for c in REVIEW_COLS:
+        if c not in d:
+            d[c] = np.nan if c in sc.ICI_WEIGHTS else ''
+    d['source_type'] = d['source_type'].fillna('').astype(str).str.strip().str.lower()
+    for c in sc.ICI_WEIGHTS:
+        d[c] = pd.to_numeric(d[c], errors='coerce')
+        d.loc[~d[c].between(0,5),c]=np.nan
+    d['video_id'] = d['video_id'].fillna('').astype(str).str.strip()
+    return d[REVIEW_COLS].loc[d['video_id'].ne('')].reset_index(drop=True)
+
+
+def _load_initial():
+    return {
+        'reels':sc.load_reels(BASE,False),
+        'trends':sc.load_trends(BASE,False),
+        'reviews':_clean_reviews(sc._load_reviews(BASE,False)),
+    }
+
+
+def _benchmark(reviews):
+    d = _clean_reviews(reviews)
+    if len(d):
+        complete = d[d['source_type'].eq('competitor')].copy()
+        complete = complete[complete[list(sc.ICI_WEIGHTS)].notna().all(axis=1)]
+        per_video = complete.groupby('video_id')[list(sc.ICI_WEIGHTS)].median(numeric_only=True)
+    else:
+        per_video = pd.DataFrame(columns=list(sc.ICI_WEIGHTS))
+    count=len(per_video)
+    if count >= 5:
+        factors={k:round(float(per_video[k].median()),2) for k in sc.ICI_WEIGHTS}
+        label=('Preliminary benchmark from '+str(count)+' reviewed competitor reels'
+               +(' — small sample' if count<15 else ''))
+        evidence=True
+    else:
+        factors={k:4.0 for k in sc.ICI_WEIGHTS}
+        label=('Provisional editorial target (4/5 per factor), NOT measured industry data. '
+               f'Only {count} complete competitor reviews; at least 5 are required for a pilot comparison.')
+        evidence=False
+    return {'factors':factors,'score':sc.score_index(factors,sc.ICI_WEIGHTS,5),
+            'count':count,'label':label,'empirical':evidence}
+
+
+def _summary(data):
+    r=data['reels']; t=data['trends']; b=_benchmark(data['reviews'])
+    return (f'**Research loaded:** {len(r)} public reel records · {len(t)} Google Trends records · '
+            f'{b["count"]} completed distinct competitor video reviews.  \n'
+            f'**ICI comparison:** {b["score"]:.1f}/100 — {b["label"]}  \n'
+            '**Method:** Human ratings + transparent calculations; no automatic video interpretation or performance prediction.')
+
+
+def _preview_reels(d):
+    cols=['reel_id','creator','category','caption','metric','metric_basis','likes','comments']
+    return d.reindex(columns=cols).head(15)
+
+
+def _upload_reels(path,data):
+    if not path:
+        return data,'Please choose an Apify CSV or JSON file.',pd.DataFrame(),_summary(data)
+    try:
+        incoming=sc.normalize_reels(sc._raw_file(path))
+        if incoming.empty:
+            raise ValueError('No recognised reel IDs or URLs. Check the file format.')
+        updated=_clone(data)
+        updated['reels']=pd.concat([data['reels'],incoming],ignore_index=True).drop_duplicates('reel_id',keep='first')
+        nmetric=int(updated['reels']['metric'].notna().sum())
+        message=(f'**Loaded {len(incoming)} reel rows.** You now have {len(updated["reels"])} distinct reels; '
+                 f'{nmetric} contain public views or plays. Data are available to all tabs **in this browser session**. '
+                 'Use the Download button to keep a copy; the web server does not save your upload permanently.')
+        return updated,message,_preview_reels(updated['reels']),_summary(updated)
+    except Exception as e:
+        return data,f'**Import error:** {e}',pd.DataFrame(),_summary(data)
+
+
+def _upload_trends(path, collection_date, data):
+    if not path:
+        return data,'Please choose a Google Trends CSV.',pd.DataFrame(),_summary(data)
+    try:
+        # Try canonical research CSVs first; raw Google Trends exports can have
+        # multiple header/preamble lines and must use normalize_trends() instead.
+        try:
+            raw=sc._raw_file(path)
+        except (ValueError, pd.errors.ParserError, UnicodeError):
+            raw=pd.DataFrame()
+        if 'search_term' in raw.columns and 'snapshot_date' in raw.columns:
+            incoming=raw.copy()
+            for c in TREND_COLS:
+                if c not in incoming:
+                    incoming[c]=''
+            incoming=incoming[TREND_COLS]
+            incoming['category']=incoming.apply(
+                lambda row: row['category'] if str(row['category']) in sc.CATEGORIES
+                else sc.category_for(row['search_term']),axis=1)
+        else:
+            incoming=sc.normalize_trends(path,collection_date or None)
+        if incoming.empty:
+            raise ValueError('No recognizable trend rows. Please export CSV from Google Trends Trending Now.')
+        updated=_clone(data)
+        updated['trends']=pd.concat([data['trends'],incoming],ignore_index=True).drop_duplicates(
+            ['search_term','snapshot_date'],keep='last')
+        found=int(updated['trends']['category'].isin(sc.CATEGORIES).sum())
+        return (updated,
+                f'**Loaded {len(incoming)} trend records.** Total: {len(updated["trends"])}; '
+                f'{found} have a keyword-matched VicharDesk content category. '
+                'These are historical searches, not live trends.',
+                updated['trends'].head(15),_summary(updated))
+    except Exception as e:
+        return data,f'**Trends import error:** {e}',pd.DataFrame(),_summary(data)
+
+
+def _upload_reviews(path,data):
+    if not path:
+        return data,'Please choose a CSV of completed ICI reviews.',pd.DataFrame(),_summary(data)
+    try:
+        incoming=_clean_reviews(sc._raw_file(path))
+        if incoming.empty:raise ValueError('No video_id values detected.')
+        updated=_clone(data)
+        updated['reviews']=pd.concat([data['reviews'],incoming],ignore_index=True).drop_duplicates(
+            ['video_id','reviewer','review_date'],keep='last')
+        b=_benchmark(updated['reviews'])
+        return (updated,
+            f'Loaded {len(incoming)} review rows; **{b["count"]} distinct completed competitor video reviews** '
+            f'are usable for the ICI comparison. Incomplete placeholders do not count. {b["label"]}',
+            updated['reviews'].head(15),_summary(updated))
+    except Exception as e:
+        return data,f'**Review import error:** {e}',pd.DataFrame(),_summary(data)
+
+
+def _competitors(data):
+    d=data['reels']
+    if d.empty:
+        return ('No public reel records yet. Open **1 · Upload Research** and upload your Apify export.',
+                pd.DataFrame(),pd.DataFrame())
+    x=sc.competitor_metrics(d)
+    metric_counts=d['metric_basis'].fillna('unavailable').value_counts().to_dict()
+    table=sc.market_table(d)
+    top=x.sort_values('relative_performance',ascending=False).reindex(columns=[
+        'creator','category','caption','metric','metric_basis','relative_performance','engagement_proxy','reel_url']).head(20)
+    description=(f'**{len(d)} reels from {d["creator"].nunique()} creators.** Count types: {metric_counts}. '
+                 'Relative performance = reel public views/plays ÷ that creator’s median of the *same metric type* '
+                 '(requires at least two comparable reels). Likes and comments / public count is only a proxy; '
+                 'it is not engagement per reach. Categories are keyword-assigned where not manually labelled.')
+    return description,table,top.round(3)
+
+
+def _topic_finder(category,data):
+    t=sc.topics_with_evidence(data['reels'],data['trends'])
+    if category!='All':t=t[t['Category']==category]
+    note=('These are **editorially curated video ideas**. Research priority /4 is an evidence triage score, '
+          '**not a predicted view count or a Story Potential Index**. If evidence is missing, a topic is '
+          'marked research pending. Uploaded trend records are dated, not real-time.')
+    return note,t.head(18)
+
+
+def _score_spi(title,category,angle,*values):
+    try:
+        s=dict(zip(sc.SPI_WEIGHTS,values)); value=sc.score_spi(s)
+        table=pd.DataFrame([{'Factor':sc.SPI_LABELS[k],'Your rating /100':s[k],
+                             'Weight':f'{w}%','Weighted contribution':round(s[k]*w/100,1)}
+                            for k,w in sc.SPI_WEIGHTS.items()])
+        return (f'### {title or "Untitled topic"}: {value:.1f}/100\n'
+                f'Category: **{category}**. Proposed angle: {angle or "Not specified"}.  \n'
+                '**This is a structured human assessment; it is not a forecast of viral success.**'),table
+    except Exception as e:
+        return f'Rating issue: {e}',pd.DataFrame()
+
+
+def _benchmark_display(data):
+    b=_benchmark(data['reviews'])
+    table=pd.DataFrame([{'Factor':sc.ICI_LABELS[k], 'Reference /5':v,
+                         'Weight':f'{sc.ICI_WEIGHTS[k]}%'} for k,v in b['factors'].items()])
+    return f'**ICI reference: {b["score"]:.1f}/100.** {b["label"]}',table
+
+
+def _ici(video,title,source_type,video_id,reviewer,notes,confirmed,data,*values):
+    if not confirmed:
+        return 'Please review the actual video and confirm all eight factor ratings before calculating.',pd.DataFrame()
+    try:
+        ratings=dict(zip(sc.ICI_WEIGHTS,values)); total=sc.score_index(ratings,sc.ICI_WEIGHTS,5)
+        b=_benchmark(data['reviews']); below=[]; rows=[]
+        for k,w in sc.ICI_WEIGHTS.items():
+            actual=float(ratings[k]); ref=b['factors'][k]
+            if actual<ref:below.append(k)
+            rows.append({'Factor':sc.ICI_LABELS[k],'Weight':f'{w}%',
+                         'Your score /5':actual,'Reference /5':ref,
+                         'Difference':round(actual-ref,2),
+                         'Weighted points /100':round(actual*w/5,1),
+                         'Meets reference?':'Yes' if actual>=ref else 'No'})
+        suggestions='\n'.join(f'- {sc.ICI_TIPS[k]}' for k in below[:4]) if below else 'All factors meet or exceed the current reference.'
+        desc=(f'### {title or "Draft reel"}: {total:.1f}/100  ·  Reference: {b["score"]:.1f}/100\n\n'
+              f'**Factor match:** {8-len(below)}/8 · **Weighted difference:** {total-b["score"]:+.1f} points.  \n'
+              f'**Benchmark:** {b["label"]}\n\n'
+              f'**Changes to consider**\n{suggestions}\n\n'
+              '*Ratings are supplied by a human reviewer. Uploading a video alone does not analyse its content. '
+              'Your draft and this evaluation are not saved to a public database.*')
+        return desc,pd.DataFrame(rows)
+    except Exception as e:
+        return f'ICI scoring problem: {e}',pd.DataFrame()
+
+
+def _save_review(video_id,title,source_type,reviewer,notes,confirmed,data,*values):
+    if not confirmed:
+        return data,'Review the video and confirm the eight ratings first.',*_benchmark_display(data),_summary(data)
+    if source_type!='competitor':
+        return data,'Only reviewed **competitor** videos belong in the competitor benchmark. Your own draft is not added.',*_benchmark_display(data),_summary(data)
+    try:
+        rating=dict(zip(sc.ICI_WEIGHTS,values)); total=sc.score_index(rating,sc.ICI_WEIGHTS,5)
+        row={'video_id':video_id.strip() or f'REVIEW_{uuid.uuid4().hex[:12]}',
+             'title':title or 'Untitled competitor reel', 'source_type':'competitor',
+             'reviewer':reviewer or 'Visitor', 'review_date':datetime.now(timezone.utc).date().isoformat(),
+             'overall_score':total,'notes':notes or '',**rating}
+        updated=_clone(data)
+        updated['reviews']=pd.concat([data['reviews'],pd.DataFrame([row])],ignore_index=True)
+        updated['reviews']=_clean_reviews(updated['reviews']).drop_duplicates(
+            ['video_id','reviewer','review_date'],keep='last')
+        b=_benchmark(updated['reviews'])
+        return (updated,
+                f'**Added completed competitor review to this browser session.** '
+                f'{b["count"]} distinct competitor reels now rated. '
+                'Download the research CSV bundle to keep this review.',
+                *_benchmark_display(updated),_summary(updated))
+    except Exception as e:
+        return data,f'Could not add review: {e}',*_benchmark_display(data),_summary(data)
+
+
+def _feedback(reel,views,reach,shares,saves,follows):
+    try:
+        if not str(reel).strip():raise ValueError('Enter a reel title or ID.')
+        if reach is None or float(reach)<=0:raise ValueError('Reach must be greater than zero.')
+        counts={'Views':views,'Shares':shares,'Saves':saves,'Follows':follows}
+        for k,v in counts.items():
+            if v is not None and (pd.isna(v) or float(v)<0):raise ValueError(f'{k} must be nonnegative.')
+        rows=[{'Metric':k,'Observed count':v, 'Rate per reach':round(float(v)/float(reach),4) if v is not None else np.nan}
+              for k,v in counts.items()]
+        return (f'**{reel}** — reach: {reach:,.0f}. '
+                'The rate denominator is accounts reached. These are verified user-entered numbers, '
+                'not inferred from public competitor reels. Results are not saved on the server.'),pd.DataFrame(rows)
+    except Exception as e:
+        return f'Please check the inputs: {e}',pd.DataFrame()
+
+
+def _rule_answer(question,history,data):
+    q=(question or '').strip().lower()
+    if not q:return 'Ask about competitor patterns, topic ideas, trends or the quality index.'
+    if any(w in q for w in ['trend','search']):
+        t=data['trends']
+        if t.empty:return 'No trends have been loaded. Open Upload Research and choose your Google Trends CSV.'
+        first=t[t['category'].isin(sc.CATEGORIES)]
+        return f'The dataset contains {len(t)} dated trends. Relevant examples: '+(', '.join(first['search_term'].astype(str).head(6)) or 'No keyword matches')+'. They may not be trending today.'
+    if any(w in q for w in ['suggest','topic','idea','make next','create next']):
+        tab=sc.topics_with_evidence(data['reels'],data['trends'])
+        texts=[]
+        for _,r in tab.head(5).iterrows():
+            value=r['Research priority (/5)']
+            signal=f'{int(value)}/5' if pd.notna(value) else 'research pending'
+            texts.append(f'- **{r["Topic"]}** ({r["Category"]}) — {signal}; angle: {r["Proposed angle"]}')
+        return 'Curated topic ideas (not forecasts):\n\n'+'\n'.join(texts)
+    if any(w in q for w in ['compet','view','market','engagement','perform']):
+        d=data['reels']
+        if d.empty:return 'No competitor reels yet. Upload an Apify CSV or JSON to start.'
+        return f'The dataset includes {len(d)} reels across {d["creator"].nunique()} accounts.\n\n'+sc.market_table(d).head(6).to_markdown(index=False)+'\n\nThese are descriptive indicators.'
+    if any(w in q for w in ['ici','index','benchmark','rate','quality']):
+        b=_benchmark(data['reviews'])
+        return f'The ICI reference is {b["score"]:.1f}/100. {b["label"]} Use Reel Quality Index for the complete eight-factor breakdown.'
+    return 'I am a rule-based guide, not an LLM. Try “Suggest topics”, “What trends were uploaded?”, “Analyse competitors” or “Explain ICI benchmark”.'
+
+
+def _export_bundle(data):
+    target=Path(tempfile.mkdtemp(prefix='storyscout_session_'))
+    zipname=target/'StoryScout_Research_Export.zip'
+    with zipfile.ZipFile(zipname,'w',zipfile.ZIP_DEFLATED) as z:
+        for key,filename in [('reels','lite_competitor_reels.csv'),('trends','lite_trends.csv'),
+                             ('reviews','lite_ici_reviews.csv')]:
+            csv=target/filename
+            data[key].to_csv(csv,index=False)
+            z.write(csv,arcname=f'data/{filename}')
+        z.writestr('README.txt',
+          'StoryScout Lite research export. The data are provided by the session user and may include private information.\n'
+          'Review carefully before publishing CSVs to GitHub.\n'
+          'For permanent public research, upload sanitized CSV files to repository data/ and commit.\n')
+    return str(zipname)
+
+
+def _export_report(data):
+    reels=data['reels']; trends=data['trends']; bm=_benchmark(data['reviews'])
+    parts=[
+      '# StoryScout Lite — Research Summary',
+      'Generated on '+datetime.now(timezone.utc).date().isoformat(),
+      '', '## Data coverage',
+      f'- Reel records: {len(reels)}', f'- Creators: {reels["creator"].nunique() if len(reels) else 0}',
+      f'- Historical trend records: {len(trends)}',f'- Completed competitor ICI reviews: {bm["count"]}',
+      '', '## Competitive content supply and engagement (descriptive)']
+    if len(reels):parts.append(sc.market_table(reels).to_markdown(index=False))
+    else:parts.append('No public reels loaded.')
+    parts+=['','## Candidate topics (curated)',
+             sc.topics_with_evidence(reels,trends).head(12).reindex(columns=[
+              'Topic','Category','Matched trends','Matching competitor reels','Evidence status']).to_markdown(index=False),
+             '', '## Industry Content Index',
+             f'Reference: {bm["score"]:.1f}/100. {bm["label"]}',
+             '', '## Interpretation',
+             'Views and searches are imperfect proxies for consumer interest; the sample is not representative.',
+             'Topic research scores and human ICI ratings are not forecasts, causal evidence, or automatic AI analysis.',
+             'Stored trends are snapshots and must not be presented as current when outdated.'
+           ]
+    path=Path(tempfile.mkdtemp(prefix='storyscout_report_'))/'StoryScout_Research_Summary.md'
+    path.write_text('\n'.join(parts),encoding='utf-8')
+    return str(path)
+
+
 def init_app(base):
     global BASE
     BASE=sc.choose_paths(base)
-    sc.make_demo(BASE)
-
-    def summary(demo):
-        reels=sc.load_reels(BASE,demo); trends=sc.load_trends(BASE,demo); bm=sc.industry_benchmark(BASE,demo)
-        label='**SYNTHETIC DEMONSTRATION** — all sample metrics are invented for interface testing.' if demo else '**REAL RESEARCH MODE** — only uploaded / existing records are used.'
-        return (f'{label}\n\n'
-            f'**Public reels:** {len(reels)} · **Google Trends records:** {len(trends)} · '
-            f'**Completed distinct competitor reviews:** {bm["count"]}\n\n'
-            f'**ICI reference:** {bm["score"]:.0f}/100 — {bm["status"]}.\n\n'
-            'No external API, automatic video analysis or prediction model is running.')
-
-    def add_apify(path,demo):
-        if not path:return 'Please upload a CSV or JSON file first.',pd.DataFrame()
-        try:
-            result=sc.import_reels_file(BASE,path)
-            d=sc.load_reels(BASE,False)
-            msg=(f'Imported {result["imported_rows"]} records. Research database now has '
-                 f'{result["unique_rows"]} unique reels and {result["valid_metric_rows"]} with a public count. '
-                 'Switch **Synthetic demo** OFF to inspect your real data.')
-            cols=['creator','caption','metric','metric_basis','category']
-            return msg,d[cols].head(12)
-        except Exception as e:return f'Import problem: {e}',pd.DataFrame()
-
-    def add_trends(path,date_text):
-        if not path:return 'Please upload the exported CSV file first.',pd.DataFrame()
-        try:
-            result=sc.import_trends_file(BASE,path,date_text.strip() or None)
-            data=sc.load_trends(BASE,False)
-            return (f'Imported {result["new_rows"]} trends; {result["total_rows"]} now stored. '
-                    f'{result["relevant_by_keyword"]} received a relevant topic classification via keyword matching. '
-                    'Others remain available but are not automatically recommended.'),data.head(12)
-        except Exception as e:return f'Trends import problem: {e}',pd.DataFrame()
-
-    def report_file(demo):
-        return sc.export_research_report(BASE,demo)
-
-    def competitors(demo):
-        d=sc.load_reels(BASE,demo)
-        if d.empty:return 'No competitor records yet. Import Apify CSV/JSON under **Load Data**, or enable synthetic demo.',pd.DataFrame(),pd.DataFrame()
-        kinds=d['metric_basis'].value_counts().to_dict()
-        cover=int(sc.competitor_metrics(d)['relative_performance'].notna().sum())
-        warning=('**SYNTHETIC DEMO:** This is fictional data. ' if demo else '')
-        desc=(f'{warning}**{len(d)} reels across {d["creator"].nunique()} accounts.** '
-              f'Metric types: {kinds}. Relative performance is calculated against each creator’s own median, '
-              f'using the *same* count type; {cover} rows have a usable baseline. '
-              'Likes+comments divided by public count is an engagement proxy, not engagement per reach. '
-              'Categories are keyword-classified when the source did not provide them.')
-        table=sc.market_table(d)
-        top=sc.competitor_metrics(d).sort_values('relative_performance',ascending=False)
-        fields=['creator','category','caption','metric','metric_basis','relative_performance','engagement_proxy','reel_url']
-        return desc,table,top[fields].head(15).round(3)
-
-    def find_topics(cat,demo):
-        reels=sc.load_reels(BASE,demo);trends=sc.load_trends(BASE,demo)
-        t=sc.topics_with_evidence(reels,trends)
-        if cat!='All':t=t[t['Category'].eq(cat)]
-        status=('**SYNTHETIC DEMO.** ' if demo else '')
-        status+='Each topic is a **curated editorial idea**. Research priority (0–4) is a transparent triage indicator, **not** a prediction or SPI score. Missing supporting evidence means “Research pending.” Google Trends figures are a dated snapshot.'
-        return status,t.head(18)
-
-    def score_topic(title,category,angle,*values):
-        try:
-            factor=dict(zip(sc.SPI_WEIGHTS,values))
-            score=sc.score_spi(factor)
-            table=pd.DataFrame([{'Factor':sc.SPI_LABELS[k], 'Your assessment /100':factor[k],
-                   'Weight':f'{w}%', 'Contribution':round(factor[k]*w/100,1)} for k,w in sc.SPI_WEIGHTS.items()])
-            return (f'### Topic evaluation: {title or "Untitled idea"}\n'
-                    f'**SPI: {score:.1f}/100** — **editor-rated, not data-calibrated**.  '
-                    f'Category: {category}; angle: {angle or "not specified"}.\n\n'
-                    'This is a structured comparison of your assumptions. The Topic Finder lists the actual evidence separately. '
-                    'A high subjective SPI does not guarantee good performance.'),table
-        except Exception as e:return f'Unable to score: {e}',pd.DataFrame()
-
-    def do_ici(video,title,source_type,video_id,reviewer,notes,confirmed,demo,*ratings):
-        if not confirmed:return 'Watch the reel (or review it independently) and confirm you assessed all eight factors before scoring.',pd.DataFrame()
-        try:
-            scores=dict(zip(sc.ICI_WEIGHTS,ratings))
-            status,table=sc.review_report(BASE,title,source_type,reviewer,notes,scores,demo=demo,save=False,video_id=video_id)
-            status=('**SYNTHETIC DEMO — this review will not be saved.**\n\n' if demo else '**Preview evaluation only — your ratings are not saved.**\n\n')+status
-            return status,table
-        except Exception as e:return f'Cannot calculate the index: {e}',pd.DataFrame()
-
-    def review_benchmark(demo):
-        b=sc.industry_benchmark(BASE,demo)
-        factors=pd.DataFrame([{'Factor':sc.ICI_LABELS[k],'Reference /5':v,'Weight':f'{sc.ICI_WEIGHTS[k]}%'} for k,v in b['factors'].items()])
-        return f'**Reference: {b["score"]:.1f}/100.** {b["status"]}; {b["count"]} completed competitor videos.',factors
-
-    def store_insights(reel_id,views,reach,shares,saves,follows,notes,demo):
-        if demo:return 'Switch off synthetic mode before recording real private Insights.',pd.DataFrame()
-        try:
-            count=sc.add_insights(BASE,reel_id,views,reach,shares,saves,follows,notes)
-            return f'Saved verified-by-you record. Total records: {count}. The application does not extract data from screenshots.',sc.performance_feedback(BASE)
-        except Exception as e:return f'Could not save: {e}',pd.DataFrame()
-
-    def see_insights(demo):
-        if demo:return 'No real Insights are shown in synthetic mode.',pd.DataFrame()
-        data=sc.performance_feedback(BASE)
-        return ('Internal Insights are not available in this public demonstration. Share/save/follow rates are only calculated when reach is present; no missing values are invented.' if len(data) else 'No private Insights entered yet.'),data
-
-    def fixed_answer(q,history,demo):
-        text=(q or '').lower().strip()
-        if not text:return 'Ask about topics, trends, competitors, the quality index, or getting started.'
-        if 'trend' in text:
-            t=sc.load_trends(BASE,demo)
-            if t.empty:return 'There are no trends imported yet. Open **Load Data** and upload the Google Trends CSV.'
-            relevant=t[t['category'].isin(sc.CATEGORIES)]
-            names='; '.join(relevant['search_term'].head(5).astype(str)) or 'No channel-relevant terms detected yet'
-            return f'Loaded {len(t)} frozen trends. First channel-relevant queries: {names}. These were trending at collection, not necessarily now.'
-        if any(x in text for x in ['suggest','idea','topic','what to make','next video']):
-            t=sc.topics_with_evidence(sc.load_reels(BASE,demo),sc.load_trends(BASE,demo))
-            lines=[]
-            for _,r in t.head(5).iterrows():
-                val=r['Research priority (/4)']
-                evidence=f'{int(val)}/4 research priority' if pd.notna(val) else 'research pending'
-                lines.append(f'- **{r["Topic"]}** ({r["Category"]}) — {evidence}. Angle: {r["Proposed angle"]}')
-            return '**Candidate stories (curated, not AI predictions):**\n\n'+'\n'.join(lines)+'\n\nUse **Topic Finder** for the source signals and full list.'
-        if any(x in text for x in ['competitor','view','engagement','performance','market']):
-            d=sc.load_reels(BASE,demo)
-            if d.empty:return 'No public reels yet. Import your Apify CSV under **Load Data**.'
-            tab=sc.market_table(d)
-            if tab.empty:return 'Not enough public engagement data to compare.'
-            return f'Analysed {len(d)} reels across {d["creator"].nunique()} accounts.\n\n'+tab.head(5).to_markdown(index=False)+'\n\nThis is descriptive evidence, not a causal finding.'
-        if any(x in text for x in ['index','ici','benchmark','evaluate','reel','score']):
-            bm=sc.industry_benchmark(BASE,demo)
-            return f'The eight-factor ICI reference is **{bm["score"]:.1f}/100**: {bm["status"]}. Upload and watch a reel under **Reel Quality Index**, then give eight ratings to see every comparison.'
-        if any(x in text for x in ['insight','reach','save','follow']):
-            return 'Private VicharDesk Insights are intentionally excluded from the public app.'
-        return 'I am a **rule-based guide, not an LLM**. Ask: “Suggest topics”, “Show competitor patterns”, “What trends were imported?”, or “Explain the ICI benchmark”. For full actions, use the tabs.'
-
-    with gr.Blocks(title='StoryScout Lite | Content research and quality index') as app:
-        gr.Markdown('# StoryScout Lite · Content Research & Quality Index\nA public microeconomics-based content decision demo for VicharDesk. **No Gemini or AI video inference.**')
-        demo=gr.Checkbox(value=(sc.load_reels(BASE,False).empty),label='Use SYNTHETIC sample data for demonstration (never mixed with real research)')
-        status=gr.Markdown(value=summary(False))
-        demo.change(fn=summary,inputs=demo,outputs=status)
+    initial=_load_initial()
+    with gr.Blocks(title='StoryScout Lite | Research & Reel Index') as app:
+        research=gr.State(value=_load_initial)
+        gr.Markdown('# StoryScout Lite | Content Research & Quality Index\n'
+                    'Upload real data, compare competitors, discover story opportunities and review draft reels. '
+                    '**No API key or video-understanding model required.**')
+        status=gr.Markdown(value=_summary(initial))
         with gr.Tabs():
-            with gr.Tab('1 · Data & Method'):
-                gr.Markdown("""### Public research demo
-This public application is **read-only**: visitors can analyse the published research and
-score their own videos without changing the shared benchmark. It does not connect to Google Drive.
-
-**Two modes:** Public research (if the owner has supplied public Apify / Google Trends CSVs)
-and **SYNTHETIC demo** (fictional values, clearly labelled).
-
-The app measures descriptive public counts, uses a curated topic bank, and scores video quality from
-**eight human ratings**. It does **not** automatically analyse the video or predict views.
-
-**To update the public research:** the owner uploads sanitized public CSVs into the repository's
-`data/` folder and redeploys. Never publish private Instagram Insights or unlicensed video files.
-""")
-            with gr.Tab('2 · Competitor Market'):
-                gr.Markdown('**Demand proxies:** relative public counts and likes/comments. **Supply:** number of comparable reels and creators. All conclusions apply only to the selected sample.')
-                competition_btn=gr.Button('Analyse competitor market',variant='primary')
-                competition_note=gr.Markdown()
-                market_df=gr.Dataframe(label='Category comparisons',interactive=False)
-                top_df=gr.Dataframe(label='Top relative performers',interactive=False)
-                competition_btn.click(competitors,[demo],[competition_note,market_df,top_df])
-                report_btn=gr.Button("Export research summary for presentation")
-                report_download=gr.File(label="Download research summary (.md)")
-                report_btn.click(report_file,[demo],[report_download])
-            with gr.Tab('3 · StoryScout Topic Finder'):
-                gr.Markdown('The topic library is editorially prepared for VicharDesk. Search terms and competitor data are matched using explicit keywords—not LLM guesses.')
-                cat=gr.Dropdown(['All',*sc.CATEGORIES],value='All',label='Content category')
-                topics_btn=gr.Button('Suggest and rank topics',variant='primary')
-                topics_note=gr.Markdown()
-                topic_table=gr.Dataframe(label='Suggested story ideas and evidence',interactive=False)
-                topics_btn.click(find_topics,[cat,demo],[topics_note,topic_table])
-                gr.Markdown('### Optional: score a topic using the six-factor Story Potential Index\nThese are your **editorial assessments** (0–100). This does not generate an automatic prediction.')
-                title=gr.Textbox(label='Proposed title',value='Why India wants semiconductor factories')
-                topic_category=gr.Dropdown(list(sc.CATEGORIES),value='Economics',label='Category')
-                angle=gr.Textbox(label='Story angle',value='Explain why chips need a complex supply chain')
-                spi_widgets=[]
+            with gr.Tab('1 · Upload Research'):
+                gr.Markdown('### Load real research files\n'
+                    'Choose files here — they will work in **all tabs for this session**. '
+                    'Uploads are not shared with other visitors and do not permanently update GitHub. '
+                    'If you want public research available on every visit, see **How to publish datasets** below.')
                 with gr.Row():
-                    for k in list(sc.SPI_WEIGHTS)[:3]:spi_widgets.append(gr.Slider(0,100,value=50,step=5,label=f'{sc.SPI_LABELS[k]} · {sc.SPI_WEIGHTS[k]}%'))
-                with gr.Row():
-                    for k in list(sc.SPI_WEIGHTS)[3:]:spi_widgets.append(gr.Slider(0,100,value=50,step=5,label=f'{sc.SPI_LABELS[k]} · {sc.SPI_WEIGHTS[k]}%'))
-                spi_btn=gr.Button('Calculate topic SPI')
-                spi_out=gr.Markdown()
-                spi_table=gr.Dataframe(label='SPI factor breakdown',interactive=False)
-                spi_btn.click(score_topic,[title,topic_category,angle,*spi_widgets],[spi_out,spi_table])
-            with gr.Tab('4 · Reel Quality Index'):
-                gr.Markdown('Upload a draft MP4 for playback, **watch it**, and score the eight factors below. This is a human-assisted review. The tool calculates the full breakdown and compares it with the published reference. Uploaded drafts and ratings are not saved as research records.')
-                bm_btn=gr.Button('Show current reference benchmark')
-                bm_note=gr.Markdown()
-                bm_table=gr.Dataframe(label='ICI reference factor scores',interactive=False)
-                bm_btn.click(review_benchmark,[demo],[bm_note,bm_table])
-                with gr.Row():
-                    video=gr.Video(label='Upload / preview MP4 (optional if you already watched the reel)',sources=['upload'])
                     with gr.Column():
-                        reel_title=gr.Textbox(label='Video title',value='New VicharDesk draft')
-                        source=gr.Dropdown(['VicharDesk draft','competitor'],value='VicharDesk draft',label='Video type')
-                        vid=gr.Textbox(label='Reel ID (use matching Apify ID for competitor reviews)',placeholder='e.g. ABC123')
+                        apify=gr.File(label='Upload Apify reels (CSV or JSON)',file_types=['.csv','.json'],type='filepath')
+                        apify_button=gr.Button('Import public reels',variant='primary')
+                    with gr.Column():
+                        trendfile=gr.File(label='Upload Google Trends export (CSV)',file_types=['.csv'],type='filepath')
+                        trenddate=gr.Textbox(label='Snapshot date (YYYY-MM-DD; leave blank for today)',value='')
+                        trends_button=gr.Button('Import Google Trends',variant='primary')
+                import_msg=gr.Markdown()
+                preview=gr.Dataframe(label='Latest imported data preview',interactive=False)
+                apify_button.click(_upload_reels,[apify,research],[research,import_msg,preview,status])
+                trends_button.click(_upload_trends,[trendfile,trenddate,research],[research,import_msg,preview,status])
+                gr.Markdown('### Optional: Upload reviewed competitor ICI ratings\n'
+                    'If you have a CSV with `video_id`, `source_type=competitor`, and eight factor columns '
+                    '(`hook`, `narrative`, `clarity`, `visuals`, `pacing`, `relevance`, `shareability`, `brand_cta`), '
+                    'import it here. Rows with missing ratings are ignored by the benchmark.')
+                with gr.Row():
+                    reviewfile=gr.File(label='ICI reviews CSV',file_types=['.csv'],type='filepath')
+                    reviewbutton=gr.Button('Import completed ICI reviews')
+                reviewbutton.click(_upload_reviews,[reviewfile,research],[research,import_msg,preview,status])
+                gr.Markdown('### Download your session research\n'
+                    'This ZIP contains the *currently loaded* research tables so you can save them. '
+                    'Remove private data before putting them in a public GitHub repository.')
+                export_btn=gr.Button('Download loaded research CSVs')
+                exported=gr.File(label='Research data ZIP')
+                export_btn.click(_export_bundle,[research],[exported])
+                gr.Markdown('**How to publish datasets permanently:** Download the ZIP, extract the three CSVs, '
+                            'upload the cleaned files to your GitHub repository under `data/`, and commit. '
+                            'Render will redeploy automatically. Your website link stays the same.')
+            with gr.Tab('2 · Competitor Market'):
+                gr.Markdown('Compare observed public views/plays and engagement. Accounts differ in audience size, so creator-normalised counts are shown.')
+                cb=gr.Button('Analyse competitors',variant='primary')
+                ct=gr.Markdown(); market=gr.Dataframe(label='Category summary',interactive=False)
+                top=gr.Dataframe(label='Relative performance by reel',interactive=False)
+                cb.click(_competitors,[research],[ct,market,top])
+                report_btn=gr.Button('Export presentation research summary')
+                report_download=gr.File(label='Download report (.md)')
+                report_btn.click(_export_report,[research],[report_download])
+            with gr.Tab('3 · StoryScout Topic Finder'):
+                gr.Markdown('The system recommends ideas from a fixed VicharDesk editorial library and tags supporting trends/competitor content using rules, not an LLM.')
+                category=gr.Dropdown(['All',*sc.CATEGORIES],value='All',label='Category')
+                topic_btn=gr.Button('Suggest topics from loaded research',variant='primary')
+                tn=gr.Markdown(); tt=gr.Dataframe(label='Suggested topics and supporting evidence',interactive=False)
+                topic_btn.click(_topic_finder,[category,research],[tn,tt])
+                gr.Markdown('### Optional — Score a proposed topic (SPI)')
+                title=gr.Textbox(label='Proposed title',placeholder='e.g. Why gold prices change in India')
+                tc=gr.Dropdown(list(sc.CATEGORIES),value='Economics',label='Category')
+                angle=gr.Textbox(label='Unique angle',placeholder='What will make this explainer different?')
+                spi_sliders=[]
+                with gr.Row():
+                    for k in list(sc.SPI_WEIGHTS)[:3]:
+                        spi_sliders.append(gr.Slider(0,100,step=5,value=50,label=f'{sc.SPI_LABELS[k]} ({sc.SPI_WEIGHTS[k]}%)'))
+                with gr.Row():
+                    for k in list(sc.SPI_WEIGHTS)[3:]:
+                        spi_sliders.append(gr.Slider(0,100,step=5,value=50,label=f'{sc.SPI_LABELS[k]} ({sc.SPI_WEIGHTS[k]}%)'))
+                spi_btn=gr.Button('Calculate Story Potential Index')
+                spi_text=gr.Markdown(); spi_table=gr.Dataframe(label='SPI factor breakdown',interactive=False)
+                spi_btn.click(_score_spi,[title,tc,angle,*spi_sliders],[spi_text,spi_table])
+            with gr.Tab('4 · Reel Quality Index'):
+                gr.Markdown('### Eight-factor review of an uploaded reel\n'
+                    'Watch the actual reel and choose the eight factor ratings. '
+                    '**An MP4 upload is for playback only**; there is no automatic AI review.')
+                bench_btn=gr.Button('Show benchmark')
+                bench_text=gr.Markdown(value=_benchmark_display(initial)[0])
+                bench_table=gr.Dataframe(label='Benchmark for each factor',interactive=False,
+                                         value=_benchmark_display(initial)[1])
+                bench_btn.click(_benchmark_display,[research],[bench_text,bench_table])
+                with gr.Row():
+                    vidfile=gr.Video(label='Upload / play reel MP4',sources=['upload'])
+                    with gr.Column():
+                        reel_title=gr.Textbox(label='Video title',placeholder='New VicharDesk draft')
+                        source_type=gr.Dropdown(['VicharDesk draft','competitor'],value='VicharDesk draft',label='Video type')
+                        video_id=gr.Textbox(label='Reel ID (helps group ratings of the same competitor reel)')
                         reviewer=gr.Textbox(label='Reviewer',value='Student reviewer')
-                        notes=gr.Textbox(label='Observations / source notes',lines=3)
-                sliders=[]
+                        note=gr.Textbox(label='Supporting observations',lines=3)
+                ici_sliders=[]
                 with gr.Row():
-                    for k in list(sc.ICI_WEIGHTS)[:4]:sliders.append(gr.Slider(0,5,value=3,step=1,label=f'{sc.ICI_LABELS[k]} ({sc.ICI_WEIGHTS[k]}%)'))
+                    for k in list(sc.ICI_WEIGHTS)[:4]:
+                        ici_sliders.append(gr.Slider(0,5,step=1,value=3,label=f'{sc.ICI_LABELS[k]} ({sc.ICI_WEIGHTS[k]}%)'))
                 with gr.Row():
-                    for k in list(sc.ICI_WEIGHTS)[4:]:sliders.append(gr.Slider(0,5,value=3,step=1,label=f'{sc.ICI_LABELS[k]} ({sc.ICI_WEIGHTS[k]}%)'))
-                check=gr.Checkbox(value=False,label='I have watched/reviewed the reel and deliberately chosen all eight scores.')
-                ici_btn=gr.Button('Calculate full ICI report',variant='primary')
-                ici_note=gr.Markdown()
-                ici_df=gr.Dataframe(label='Complete factor-by-factor index match',interactive=False)
-                ici_btn.click(do_ici,[video,reel_title,source,vid,reviewer,notes,check,demo,*sliders],[ici_note,ici_df]).then(summary,[demo],[status])
+                    for k in list(sc.ICI_WEIGHTS)[4:]:
+                        ici_sliders.append(gr.Slider(0,5,step=1,value=3,label=f'{sc.ICI_LABELS[k]} ({sc.ICI_WEIGHTS[k]}%)'))
+                confirmed=gr.Checkbox(value=False,label='I watched the reel (or independently reviewed it) and consciously rated all eight factors.')
+                ici_btn=gr.Button('Calculate complete ICI comparison',variant='primary')
+                ici_desc=gr.Markdown(); ici_table=gr.Dataframe(label='Factor-by-factor index match',interactive=False)
+                ici_btn.click(_ici,[vidfile,reel_title,source_type,video_id,reviewer,note,confirmed,research,*ici_sliders],
+                              [ici_desc,ici_table])
+                gr.Markdown('### Build a competitor benchmark\n'
+                    'If this was a competitor reel, you can add the reviewed scores to your **session** benchmark. '
+                    'At least 5 distinct complete competitor reviews are required before the app uses a pilot industry comparison.')
+                save_btn=gr.Button('Add reviewed competitor reel to session benchmark')
+                save_note=gr.Markdown()
+                save_btn.click(_save_review,[video_id,reel_title,source_type,reviewer,note,confirmed,research,*ici_sliders],
+                               [research,save_note,bench_text,bench_table,status])
             with gr.Tab('5 · Performance Feedback'):
-                gr.Markdown("""### Private performance evaluation (offline only)
-Verified VicharDesk Insights are intentionally **not hosted on this public website**.
-The team's Colab version supports entering private reach, saves, shares and follows.
-The publicly displayed industry benchmark uses only the published, completed competitor reviews,
-or a clearly marked provisional reference when none are available.
-""")
-            with gr.Tab('6 · Ask StoryScout (rule-based)'):
-                gr.Markdown('A simple command-based helper. It is deliberately **not a generative AI chatbot** and responds only to supported questions.')
-                gr.ChatInterface(fn=fixed_answer,additional_inputs=[demo],examples=[['Suggest 5 video topics',False],['What are our competitor patterns?',False],['Explain the ICI benchmark',False],['What trends are imported?',False]])
-        gr.Markdown('**Research note:** Topic research priorities and index scores guide editorial decisions; they are neither calibrated forecasts nor causal estimates of Instagram performance.')
+                gr.Markdown('Enter **verified** VicharDesk Insights values. This section calculates rates in your browser session only; it does not automatically read screenshots or store private metrics.')
+                with gr.Row():
+                    fid=gr.Textbox(label='Reel title or ID')
+                    fv=gr.Number(label='Views (optional)',minimum=0)
+                    fr=gr.Number(label='Reach (required)',minimum=1)
+                with gr.Row():
+                    fs=gr.Number(label='Shares (optional)',minimum=0)
+                    fsave=gr.Number(label='Saves (optional)',minimum=0)
+                    ff=gr.Number(label='Follows (optional)',minimum=0)
+                fbtn=gr.Button('Calculate performance rates')
+                ftxt=gr.Markdown(); ftable=gr.Dataframe(label='Rates per reach',interactive=False)
+                fbtn.click(_feedback,[fid,fv,fr,fs,fsave,ff],[ftxt,ftable])
+            with gr.Tab('6 · Ask StoryScout'):
+                gr.Markdown('A **rule-based research helper**, not a generative AI chatbot. It answers supported queries using the research in your current session.')
+                gr.ChatInterface(fn=_rule_answer,additional_inputs=[research])
+        gr.Markdown('**Study note:** This tool supports evidence-informed editorial choices. It does not predict Instagram views, measure causal impact, or infer video quality from an upload alone.')
     return app

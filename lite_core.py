@@ -262,11 +262,11 @@ def topics_with_evidence(reels,trends):
             'Opening hook':r['hook'],'Est. hours':r['estimated_hours'],
             'Matched trends':trends_n,'Matching competitor reels':cm,'Competitor creators':cmr,
             'Median relative public count':round(float(rv),2) if pd.notna(rv) else np.nan,
-            'Research priority (/4)':priority if demand_seen else np.nan,
+            'Research priority (/5)':priority if demand_seen else np.nan,
             'Evidence status':label,
             'Matched trend terms':', '.join(ts['search_term'].head(3)) if trends_n else '',
             'Reel URLs':', '.join(matches['reel_url'].dropna().head(3)) if cm else ''})
-    return pd.DataFrame(results).sort_values(['Research priority (/4)','Matched trends','Matching competitor reels','Topic'],ascending=[False,False,False,True],na_position='last').reset_index(drop=True)
+    return pd.DataFrame(results).sort_values(['Research priority (/5)','Matched trends','Matching competitor reels','Topic'],ascending=[False,False,False,True],na_position='last').reset_index(drop=True)
 
 def score_index(scores,weights,max_value):
     if any(k not in scores or scores[k] is None or (isinstance(scores[k],float) and pd.isna(scores[k])) for k in weights):

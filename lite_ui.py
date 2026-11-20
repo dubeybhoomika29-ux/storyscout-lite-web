@@ -182,7 +182,7 @@ def _competitors(data):
 def _topic_finder(category,data):
     t=sc.topics_with_evidence(data['reels'],data['trends'])
     if category!='All':t=t[t['Category']==category]
-    note=('These are **editorially curated video ideas**. Research priority /4 is an evidence triage score, '
+    note=('These are **editorially curated video ideas**. Research priority /5 is an evidence triage score, '
           '**not a predicted view count or a Story Potential Index**. If evidence is missing, a topic is '
           'marked research pending. Uploaded trend records are dated, not real-time.')
     return note,t.head(18)

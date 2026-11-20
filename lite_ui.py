@@ -182,7 +182,7 @@ def _competitors(data):
 def _topic_finder(category,data):
     t=sc.topics_with_evidence(data['reels'],data['trends'])
     if category!='All':t=t[t['Category']==category]
-    note=('These are **editorially curated video ideas**. Research priority /5 is an evidence triage score, '
+    note=('These are **editorially curated video ideas**. Research priority /4 is an evidence triage score, '
           '**not a predicted view count or a Story Potential Index**. If evidence is missing, a topic is '
           'marked research pending. Uploaded trend records are dated, not real-time.')
     return note,t.head(18)
@@ -257,22 +257,6 @@ def _save_review(video_id,title,source_type,reviewer,notes,confirmed,data,*value
                 *_benchmark_display(updated),_summary(updated))
     except Exception as e:
         return data,f'Could not add review: {e}',*_benchmark_display(data),_summary(data)
-
-
-def _feedback(reel,views,reach,shares,saves,follows):
-    try:
-        if not str(reel).strip():raise ValueError('Enter a reel title or ID.')
-        if reach is None or float(reach)<=0:raise ValueError('Reach must be greater than zero.')
-        counts={'Views':views,'Shares':shares,'Saves':saves,'Follows':follows}
-        for k,v in counts.items():
-            if v is not None and (pd.isna(v) or float(v)<0):raise ValueError(f'{k} must be nonnegative.')
-        rows=[{'Metric':k,'Observed count':v, 'Rate per reach':round(float(v)/float(reach),4) if v is not None else np.nan}
-              for k,v in counts.items()]
-        return (f'**{reel}** — reach: {reach:,.0f}. '
-                'The rate denominator is accounts reached. These are verified user-entered numbers, '
-                'not inferred from public competitor reels. Results are not saved on the server.'),pd.DataFrame(rows)
-    except Exception as e:
-        return f'Please check the inputs: {e}',pd.DataFrame()
 
 
 def _rule_answer(question,history,data):
@@ -453,20 +437,7 @@ def init_app(base):
                 save_note=gr.Markdown()
                 save_btn.click(_save_review,[video_id,reel_title,source_type,reviewer,note,confirmed,research,*ici_sliders],
                                [research,save_note,bench_text,bench_table,status])
-            with gr.Tab('5 · Performance Feedback'):
-                gr.Markdown('Enter **verified** VicharDesk Insights values. This section calculates rates in your browser session only; it does not automatically read screenshots or store private metrics.')
-                with gr.Row():
-                    fid=gr.Textbox(label='Reel title or ID')
-                    fv=gr.Number(label='Views (optional)',minimum=0)
-                    fr=gr.Number(label='Reach (required)',minimum=1)
-                with gr.Row():
-                    fs=gr.Number(label='Shares (optional)',minimum=0)
-                    fsave=gr.Number(label='Saves (optional)',minimum=0)
-                    ff=gr.Number(label='Follows (optional)',minimum=0)
-                fbtn=gr.Button('Calculate performance rates')
-                ftxt=gr.Markdown(); ftable=gr.Dataframe(label='Rates per reach',interactive=False)
-                fbtn.click(_feedback,[fid,fv,fr,fs,fsave,ff],[ftxt,ftable])
-            with gr.Tab('6 · Ask StoryScout'):
+            with gr.Tab('5 · Ask StoryScout'):
                 gr.Markdown('A **rule-based research helper**, not a generative AI chatbot. It answers supported queries using the research in your current session.')
                 gr.ChatInterface(fn=_rule_answer,additional_inputs=[research])
         gr.Markdown('**Study note:** This tool supports evidence-informed editorial choices. It does not predict Instagram views, measure causal impact, or infer video quality from an upload alone.')
